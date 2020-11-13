@@ -215,7 +215,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.appendCh = make(chan bool)
 	rf.applyMsgCh = applyCh
 
-	electionTimeout := heartbeats*3 + rand.Intn(heartbeats)
+	electionTimeout := (heartbeats + rand.Intn(heartbeats)) * 5
 	rf.timeout = time.Duration(electionTimeout) * time.Millisecond
 	rf.timer = time.NewTimer(rf.timeout)
 
@@ -232,7 +232,7 @@ func (rf *Raft) selectState() {
 		rf.mu.Lock()
 		state := rf.state
 		rf.mu.Unlock()
-		electionTimeout := heartbeats*3 + rand.Intn(heartbeats)
+		electionTimeout := (heartbeats + rand.Intn(heartbeats)) * 5
 		rf.timeout = time.Duration(electionTimeout) * time.Millisecond
 
 		switch state {
