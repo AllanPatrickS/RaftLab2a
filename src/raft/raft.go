@@ -31,19 +31,16 @@ type Raft struct {
 	me        int
 
 	// Your data here (2A, 2B, 2C).
-	term        int
-	timer       *time.Timer
-	timeout     time.Duration
-	state       int
-	appendCh    chan bool
-	voteCh      chan bool
-	voteCount   int
-	votedFor    int
-	log         []LogEntry
-	commitIndex int
-	lastApplied int
-	nextIndex   []int
-	matchIndex  []int
+	term       int
+	timer      *time.Timer
+	timeout    time.Duration
+	state      int
+	appendCh   chan bool
+	voteCh     chan bool
+	applyMsgCh chan ApplyMsg
+	voteCount  int
+	votedFor   int
+	log        []LogEntry
 }
 
 type RequestVoteArgs struct {
@@ -77,18 +74,6 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int
 	Success bool
-}
-
-type SnapshotEntriesArgs struct {
-	Term         int
-	LeaderId     int
-	LastNewIndex int
-	LastNewTerm  int
-	Date         []byte
-}
-
-type SnapshotEntriesReply struct {
-	Term int
 }
 
 func (rf *Raft) GetState() (int, bool) {
@@ -208,29 +193,12 @@ func (rf *Raft) readSnapshot(data []byte) {
 	r := bytes.NewBuffer(data)
 	d := gob.NewDecoder(r)
 
-	var LastNewId int
-	var LastNewTerm int
+	var LastTerm int
 
-	d.Decode(&LastNewId)
-	d.Decode(&LastNewTerm)
-	rf.commitIndex, rf.lastApplied = LastNewId, LastNewId
-	rf.log = truncateLog(LastNewId, LastNewTerm, rf.log)
+	d.Decode(&LastTerm)
+	rf.log = append(rf.log, LogEntry{Term: LastTerm})
 	msg := ApplyMsg{UseSnapshot: true, Snapshot: data}
-}
-
-func (rf *Raft) sendSnapshot(server int, args SnapshotEntriesArgs, reply *SnapshotEntriesReply) bool {
-	ok := rf.peers[server].Call("Raft.Snapshot", args, reply)
-	if ok {
-		if reply.Term > rf.term {
-			rf.term = reply.Term
-			rf.state = follower
-			rf.votedFor = -1
-			return ok
-		}
-		rf.nextIndex[server], rf.matchIndex[server] = args.LastNewIndex+1, args.LastNewIndex
-	}
-
-	return ok
+	rf.applyMsgCh <- msg
 }
 
 func Make(peers []*labrpc.ClientEnd, me int,
@@ -245,78 +213,83 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.votedFor = -1
 	rf.voteCh = make(chan bool)
 	rf.appendCh = make(chan bool)
+	rf.applyMsgCh = applyCh
 
 	electionTimeout := heartbeats*3 + rand.Intn(heartbeats)
 	rf.timeout = time.Duration(electionTimeout) * time.Millisecond
 	rf.timer = time.NewTimer(rf.timeout)
-	go func() {
-		for {
-			rf.mu.Lock()
-			state := rf.state
-			rf.mu.Unlock()
-			electionTimeout := heartbeats*3 + rand.Intn(heartbeats)
-			rf.timeout = time.Duration(electionTimeout) * time.Millisecond
 
-			switch state {
-			case follower:
-				select {
-				case <-rf.appendCh:
-					rf.timer.Reset(rf.timeout)
-				case <-rf.voteCh:
-					rf.timer.Reset(rf.timeout)
-				case <-rf.timer.C:
-					rf.mu.Lock()
-					rf.state = candidate
-					rf.mu.Unlock()
-					rf.start()
-				}
-			case candidate:
-				select {
-				case <-rf.appendCh:
-					rf.timer.Reset(rf.timeout)
-					rf.mu.Lock()
-					rf.state = follower
-					rf.votedFor = -1
-					rf.mu.Unlock()
-				case <-rf.timer.C:
-					rf.start()
-				default:
-					rf.mu.Lock()
-					if rf.voteCount > len(rf.peers)/2 {
-						rf.state = leader
-					}
-					rf.mu.Unlock()
-				}
-			case leader:
-				for peer, _ := range rf.peers {
-					if peer != rf.me {
-						go func(peer int) {
-							args := AppendEntriesArgs{}
-							rf.mu.Lock()
-							args.Term = rf.term
-							args.LeaderId = rf.me
-							rf.mu.Unlock()
-							reply := AppendEntriesReply{}
-							if rf.sendAppendEntries(peer, &args, &reply) {
-								rf.mu.Lock()
-								if reply.Term > rf.term {
-									rf.term = reply.Term
-									rf.state = follower
-									rf.votedFor = -1
-								}
-								rf.mu.Unlock()
-							}
-						}(peer)
-					}
-				}
-				time.Sleep(heartbeats)
-			}
-		}
-	}()
+	go rf.selectState()
+
 	rf.readPersist(persister.ReadRaftState())
 	rf.readSnapshot(persister.ReadSnapshot())
 
 	return rf
+}
+
+func (rf *Raft) selectState() {
+	for {
+		rf.mu.Lock()
+		state := rf.state
+		rf.mu.Unlock()
+		electionTimeout := heartbeats*3 + rand.Intn(heartbeats)
+		rf.timeout = time.Duration(electionTimeout) * time.Millisecond
+
+		switch state {
+		case follower:
+			select {
+			case <-rf.appendCh:
+				rf.timer.Reset(rf.timeout)
+			case <-rf.voteCh:
+				rf.timer.Reset(rf.timeout)
+			case <-rf.timer.C:
+				rf.mu.Lock()
+				rf.state = candidate
+				rf.mu.Unlock()
+				rf.start()
+			}
+		case candidate:
+			select {
+			case <-rf.appendCh:
+				rf.timer.Reset(rf.timeout)
+				rf.mu.Lock()
+				rf.state = follower
+				rf.votedFor = -1
+				rf.mu.Unlock()
+			case <-rf.timer.C:
+				rf.start()
+			default:
+				rf.mu.Lock()
+				if rf.voteCount > len(rf.peers)/2 {
+					rf.state = leader
+				}
+				rf.mu.Unlock()
+			}
+		case leader:
+			for peer, _ := range rf.peers {
+				if peer != rf.me {
+					go func(peer int) {
+						args := AppendEntriesArgs{}
+						rf.mu.Lock()
+						args.Term = rf.term
+						args.LeaderId = rf.me
+						rf.mu.Unlock()
+						reply := AppendEntriesReply{}
+						if rf.sendAppendEntries(peer, &args, &reply) {
+							rf.mu.Lock()
+							if reply.Term > rf.term {
+								rf.term = reply.Term
+								rf.state = follower
+								rf.votedFor = -1
+							}
+							rf.mu.Unlock()
+						}
+					}(peer)
+				}
+			}
+			time.Sleep(heartbeats)
+		}
+	}
 }
 
 func (rf *Raft) start() {
