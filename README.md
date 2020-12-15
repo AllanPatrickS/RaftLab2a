@@ -1,2 +1,6 @@
 # raft-lab-2a
-Laboratorio 2a do algoritmo raft
+Lab 2a for the raft algorithm.
+
+# How to run 
++ You must have go installed
++ You can run the lab with with `Makefile`
