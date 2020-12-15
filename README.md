@@ -1,4 +1,4 @@
-# raft-lab-2a
+# Raft lab 2a
 Lab 2a for the raft algorithm.
 
 # How to run 
